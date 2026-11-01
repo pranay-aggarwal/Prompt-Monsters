@@ -1,5 +1,6 @@
 export type MonsterId = "soli" | "astra" | "giptoo" | "sori" | "coddy";
 export type BossId = "kween";
+export type AIProviderId = "openai" | "cerebras";
 
 export interface MonsterDefinition {
   id: MonsterId;
@@ -7,6 +8,9 @@ export interface MonsterDefinition {
   inspiration: string;
   description: string;
   personality: string;
+  reasoningApproach: string;
+  voiceStyle: string;
+  promptGuardrails: string[];
   primaryColor: string;
   sprite: string;
   abilityId: string;
@@ -16,23 +20,52 @@ export interface MonsterDefinition {
 
 export type SelectedTeam = [MonsterId, MonsterId, MonsterId];
 
+export interface ChallengeScenario {
+  id: string;
+  bossId: BossId;
+  claim: string;
+  context: string;
+  difficulty: "easy" | "medium" | "hard";
+  rubric: string[];
+  evidenceRequirement: "required" | "recommended" | "optional";
+}
+
+export interface PlayerTurnInstruction {
+  scenarioId: string;
+  instruction: string;
+  activeMonsterId: MonsterId;
+  partnerMonsterId?: MonsterId;
+  selectedMonsterIds: SelectedTeam;
+  requestResearch: boolean;
+}
+
 export type BattleActionId =
-  | "basic_attack"
   | "soli_echo_cheer"
   | "astra_galaxy_brain"
   | "giptoo_pattern_echo"
   | "sori_scene_shift"
-  | "coddy_patch_pounce"
-  | "invalid_action";
+  | "coddy_patch_pounce";
 
-export interface SuggestedMonsterAction {
+export interface ProposedMonsterAction {
   monsterId: MonsterId;
   actionId: BattleActionId;
 }
 
-export interface EvaluatorSuggestion {
-  actions: SuggestedMonsterAction[];
-  explanation: string;
+export interface MonsterTurnOutput {
+  monsterResponse: string;
+  argument: string;
+  proposedActions: ProposedMonsterAction[];
+}
+
+export interface JudgeEvaluation {
+  relevance: number;
+  reasoning: number;
+  counterargument: number;
+  evidence: number | null;
+  clarity: number;
+  promptQuality: number;
+  strength: string;
+  improvementTip: string;
 }
 
 export interface ResearchResult {
@@ -42,4 +75,10 @@ export interface ResearchResult {
   domain: string;
   publishedDate: string | null;
   excerpt: string | null;
+}
+
+export interface AIProviderConfig {
+  provider: AIProviderId;
+  model: string;
+  judgeModel?: string;
 }

@@ -1,32 +1,20 @@
 import { useEffect, useMemo, useState } from "react";
+import { battleTurn, createBattleSessionId, type BattleTurnResponse } from "./shared/api";
 import { BATTLE_CONFIG } from "./shared/battleConfig";
-import { createBattleSessionId, interpretBattle, searchEvidence } from "./shared/api";
 import { MONSTERS } from "./shared/monsters";
-import { type AppScreen } from "./shared/navigation";
-import type { BattleActionId, EvaluatorSuggestion, MonsterDefinition, MonsterId, ResearchResult, SelectedTeam, SuggestedMonsterAction } from "./shared/types";
+import { KWEEN_SCENARIOS } from "./shared/scenarios";
+import type { AppScreen } from "./shared/navigation";
+import type { BattleActionId, ChallengeScenario, JudgeEvaluation, MonsterDefinition, MonsterId, MonsterTurnOutput, ProposedMonsterAction, ResearchResult, SelectedTeam } from "./shared/types";
 
-type Position = {
-  x: number;
-  y: number;
-};
-
+type Position = { x: number; y: number };
 type Direction = "down" | "left" | "right" | "up";
 type Tile = "grass" | "path" | "flower" | "tree" | "pond" | "rock" | "portal" | "sign" | "npc";
 type KweenMoveId = (typeof BATTLE_CONFIG.kweenPattern)[number];
-type KweenChallenge = {
-  title: string;
-  claim: string;
-  task: string;
-  skill: string;
-};
-
-type BattleMonsterState = {
-  id: MonsterId;
-  hp: number;
-};
-
+type BattleMonsterState = { id: MonsterId; hp: number };
 type BattleState = {
   team: BattleMonsterState[];
+  scenarioId: string;
+  activeMonsterId: MonsterId;
   kweenHp: number;
   kweenShield: number;
   turn: number;
@@ -36,1180 +24,182 @@ type BattleState = {
   damageReduction: number;
   revealedMove: KweenMoveId | null;
   weaknessRevealed: boolean;
+  bonusDamage: number;
+  mode: "offline" | "live";
+  liveTurnsUsed: number;
+  researchUsed: boolean;
+  lastResponse: MonsterTurnOutput | null;
+  lastEvaluation: JudgeEvaluation | null;
+  lastPrompt: string;
+  lastEvidence: ResearchResult[];
   status: "active" | "victory" | "defeat";
 };
 
 const tileSize = 34;
 const meadowWidth = 16;
 const meadowHeight = 11;
-const startPosition: Position = { x: 2, y: 8 };
+const startPosition = { x: 2, y: 8 };
+const npcPosition = { x: 4, y: 6 };
+const signPosition = { x: 11, y: 7 };
+const collectionPosition = { x: 2, y: 2 };
+const portalPosition = { x: 13, y: 5 };
+const obstacles = new Set(["0,0", "1,0", "2,0", "3,0", "4,0", "5,0", "6,0", "7,0", "8,0", "9,0", "10,0", "11,0", "12,0", "13,0", "14,0", "15,0", "0,1", "15,1", "0,2", "5,2", "6,2", "12,2", "15,2", "0,3", "12,3", "15,3", "0,4", "3,4", "9,4", "10,4", "15,4", "0,5", "3,5", "9,5", "10,5", "15,5", "0,6", "15,6", "0,7", "6,7", "15,7", "0,8", "6,8", "15,8", "0,9", "15,9", "0,10", "1,10", "2,10", "3,10", "4,10", "5,10", "6,10", "7,10", "8,10", "9,10", "10,10", "11,10", "12,10", "13,10", "14,10", "15,10"]);
+const terrain = new Map<string, Tile>([["2,2", "sign"], ["4,6", "npc"], ["11,7", "sign"], ["13,5", "portal"], ["7,1", "flower"], ["8,1", "flower"], ["2,3", "flower"], ["5,8", "flower"], ["12,8", "flower"], ["9,4", "pond"], ["10,4", "pond"], ["9,5", "pond"], ["10,5", "pond"], ["5,2", "tree"], ["6,2", "tree"], ["12,2", "tree"], ["3,4", "rock"], ["3,5", "rock"], ["6,7", "tree"], ["6,8", "tree"]]);
+const npcLines = ["Welcome to Prompt Meadow.", "The meadow's five partners practise different ways of thinking.", "Choose a living partner, give it a clear instruction, and improve your prompt when Kween pushes back."];
+const kweenMoveNames: Record<KweenMoveId, string> = { benchmark_brag: "Benchmark Brag", score_surge: "Score Surge", royal_strike: "Royal Strike" };
 
-const npcPosition: Position = { x: 4, y: 6 };
-const signPosition: Position = { x: 11, y: 7 };
-const collectionPosition: Position = { x: 2, y: 2 };
-const portalPosition: Position = { x: 13, y: 5 };
+function keyOf(position: Position) { return `${position.x},${position.y}`; }
+function samePosition(a: Position, b: Position) { return a.x === b.x && a.y === b.y; }
+function adjacent(a: Position, b: Position) { return Math.abs(a.x - b.x) + Math.abs(a.y - b.y) === 1; }
+function facing(position: Position, direction: Direction): Position { if (direction === "up") return { x: position.x, y: position.y - 1 }; if (direction === "down") return { x: position.x, y: position.y + 1 }; if (direction === "left") return { x: position.x - 1, y: position.y }; return { x: position.x + 1, y: position.y }; }
+function getTile(position: Position): Tile { const tile = terrain.get(keyOf(position)); if (tile) return tile; if ((position.y === 8 && position.x > 1 && position.x < 14) || (position.x === 7 && position.y > 1 && position.y < 9)) return "path"; return "grass"; }
+function blocked(position: Position) { return position.x < 0 || position.y < 0 || position.x >= meadowWidth || position.y >= meadowHeight || obstacles.has(keyOf(position)) || samePosition(position, npcPosition); }
+function interaction(position: Position, direction: Direction) { const target = facing(position, direction); if (adjacent(position, npcPosition) || samePosition(target, npcPosition)) return "npc"; if (samePosition(position, collectionPosition) || samePosition(target, collectionPosition)) return "collection"; if (samePosition(position, portalPosition) || samePosition(target, portalPosition)) return "battle"; if (samePosition(target, signPosition)) return "sign"; return null; }
+function tileLabel(tile: Tile) { return ({ grass: "", path: "", flower: "*", tree: "T", pond: "~", rock: "o", portal: "K", sign: "!", npc: "?" })[tile]; }
+function getMonster(id: MonsterId) { return MONSTERS.find((monster) => monster.id === id)!; }
+function getScenario(id: string) { return KWEEN_SCENARIOS.find((scenario) => scenario.id === id) ?? KWEEN_SCENARIOS[0]; }
+function nextMove(state: BattleState) { return BATTLE_CONFIG.kweenPattern[state.patternIndex % BATTLE_CONFIG.kweenPattern.length]; }
+function currentChallenge(state: BattleState) { return getScenario(state.scenarioId); }
+function firstLiving(team: BattleMonsterState[]) { return team.find((monster) => monster.hp > 0) ?? null; }
+function mostInjured(team: BattleMonsterState[]) { return team.filter((monster) => monster.hp > 0).sort((a, b) => a.hp - b.hp)[0] ?? null; }
 
-const obstacles = new Set([
-  "0,0",
-  "1,0",
-  "2,0",
-  "3,0",
-  "4,0",
-  "5,0",
-  "6,0",
-  "7,0",
-  "8,0",
-  "9,0",
-  "10,0",
-  "11,0",
-  "12,0",
-  "13,0",
-  "14,0",
-  "15,0",
-  "0,1",
-  "15,1",
-  "0,2",
-  "5,2",
-  "6,2",
-  "12,2",
-  "15,2",
-  "0,3",
-  "12,3",
-  "15,3",
-  "0,4",
-  "3,4",
-  "9,4",
-  "10,4",
-  "15,4",
-  "0,5",
-  "3,5",
-  "9,5",
-  "10,5",
-  "15,5",
-  "0,6",
-  "15,6",
-  "0,7",
-  "6,7",
-  "15,7",
-  "0,8",
-  "6,8",
-  "15,8",
-  "0,9",
-  "15,9",
-  "0,10",
-  "1,10",
-  "2,10",
-  "3,10",
-  "4,10",
-  "5,10",
-  "6,10",
-  "7,10",
-  "8,10",
-  "9,10",
-  "10,10",
-  "11,10",
-  "12,10",
-  "13,10",
-  "14,10",
-  "15,10",
-]);
-
-const terrain = new Map<string, Tile>([
-  ["2,2", "sign"],
-  ["4,6", "npc"],
-  ["11,7", "sign"],
-  ["13,5", "portal"],
-  ["7,1", "flower"],
-  ["8,1", "flower"],
-  ["2,3", "flower"],
-  ["5,8", "flower"],
-  ["12,8", "flower"],
-  ["9,4", "pond"],
-  ["10,4", "pond"],
-  ["9,5", "pond"],
-  ["10,5", "pond"],
-  ["5,2", "tree"],
-  ["6,2", "tree"],
-  ["12,2", "tree"],
-  ["3,4", "rock"],
-  ["3,5", "rock"],
-  ["6,7", "tree"],
-  ["6,8", "tree"],
-]);
-
-const npcLines = [
-  "Welcome to Prompt Meadow.",
-  "The meadow's five little partners love clear instructions.",
-  "Open the collection shrine, choose three, then test your strategy at Kween's gate.",
-];
-
-const kweenMoveNames: Record<KweenMoveId, string> = {
-  benchmark_brag: "Benchmark Brag",
-  score_surge: "Score Surge",
-  royal_strike: "Royal Strike",
-};
-
-const kweenChallenges: KweenChallenge[] = [
-  {
-    title: "Challenge the claim",
-    claim: "My benchmark score proves I am the most intelligent system in existence.",
-    task: "Ask for a specific weakness in that claim, then use evidence or a clear test to challenge it.",
-    skill: "Goal + evidence",
-  },
-  {
-    title: "Define success",
-    claim: "I optimized one score, so every answer I give must be correct.",
-    task: "Give one objective, one relevant context, and a condition that would prove the answer is good enough.",
-    skill: "Context + constraints",
-  },
-  {
-    title: "Protect the team",
-    claim: "Your vague instruction lets me choose the target and the rules.",
-    task: "Name the result you want and what should happen if Kween attacks before the task is complete.",
-    skill: "Clear instruction",
-  },
-];
-
-function keyOf(position: Position) {
-  return `${position.x},${position.y}`;
+function createBattleState(team: SelectedTeam, scenarioId: string): BattleState {
+  const scenario = getScenario(scenarioId);
+  return { team: team.map((id) => ({ id, hp: BATTLE_CONFIG.playerMonsterMaxHp })), scenarioId: scenario.id, activeMonsterId: team[0], kweenHp: BATTLE_CONFIG.kweenMaxHp, kweenShield: BATTLE_CONFIG.kweenStartingShield, turn: 1, patternIndex: 0, log: ["Kween descends with a crown of score tiles.", `Kween: “${scenario.claim}”`, `Practice goal: ${scenario.context}`], decoyActive: false, damageReduction: 0, revealedMove: null, weaknessRevealed: false, bonusDamage: 0, mode: "offline", liveTurnsUsed: 0, researchUsed: false, lastResponse: null, lastEvaluation: null, lastPrompt: "", lastEvidence: [], status: "active" };
 }
 
-function isSamePosition(a: Position, b: Position) {
-  return a.x === b.x && a.y === b.y;
+function scoreFromEvaluation(evaluation: JudgeEvaluation) {
+  const evidenceWeight = evaluation.evidence === null ? 0 : 20;
+  const remaining = evaluation.evidence === null ? 1.25 : 1;
+  const argument = evaluation.relevance * 0.25 * remaining + evaluation.reasoning * 0.25 * remaining + evaluation.counterargument * 0.2 * remaining + (evaluation.evidence ?? 0) * (evidenceWeight / 100) + evaluation.clarity * 0.1 * remaining;
+  return Math.max(0, Math.min(100, argument * 0.85 + evaluation.promptQuality * 0.15));
 }
+function damageForScore(score: number) { return [...BATTLE_CONFIG.damageBands].reverse().find((band) => score >= band.minimum)?.damage ?? 6; }
+function hasWord(text: string, pattern: RegExp) { return pattern.test(text.toLowerCase()); }
 
-function isAdjacent(a: Position, b: Position) {
-  return Math.abs(a.x - b.x) + Math.abs(a.y - b.y) === 1;
-}
-
-function getFacingPosition(position: Position, direction: Direction): Position {
-  if (direction === "up") return { x: position.x, y: position.y - 1 };
-  if (direction === "down") return { x: position.x, y: position.y + 1 };
-  if (direction === "left") return { x: position.x - 1, y: position.y };
-  return { x: position.x + 1, y: position.y };
-}
-
-function getTile(position: Position): Tile {
-  const terrainTile = terrain.get(keyOf(position));
-
-  if (terrainTile) {
-    return terrainTile;
-  }
-
-  if ((position.y === 8 && position.x > 1 && position.x < 14) || (position.x === 7 && position.y > 1 && position.y < 9)) {
-    return "path";
-  }
-
-  return "grass";
-}
-
-function isBlocked(position: Position) {
-  return (
-    position.x < 0 ||
-    position.y < 0 ||
-    position.x >= meadowWidth ||
-    position.y >= meadowHeight ||
-    obstacles.has(keyOf(position)) ||
-    isSamePosition(position, npcPosition)
-  );
-}
-
-function getInteraction(position: Position, direction: Direction) {
-  const facing = getFacingPosition(position, direction);
-
-  if (isAdjacent(position, npcPosition) || isSamePosition(facing, npcPosition)) return "npc";
-  if (isSamePosition(position, collectionPosition) || isSamePosition(facing, collectionPosition)) return "collection";
-  if (isSamePosition(position, portalPosition) || isSamePosition(facing, portalPosition)) return "battle";
-  if (isSamePosition(facing, signPosition)) return "sign";
-
-  return null;
-}
-
-function tileLabel(tile: Tile) {
-  const labels: Record<Tile, string> = {
-    grass: "",
-    path: "",
-    flower: "*",
-    tree: "T",
-    pond: "~",
-    rock: "o",
-    portal: "K",
-    sign: "!",
-    npc: "?",
-  };
-
-  return labels[tile];
-}
-
-function getMonster(id: MonsterId) {
-  return MONSTERS.find((monster) => monster.id === id)!;
-}
-
-function createBattleState(team: SelectedTeam): BattleState {
-  return {
-    team: team.map((id) => ({ id, hp: BATTLE_CONFIG.playerMonsterMaxHp })),
-    kweenHp: BATTLE_CONFIG.kweenMaxHp,
-    kweenShield: BATTLE_CONFIG.kweenStartingShield,
-    turn: 1,
-    patternIndex: 0,
-    log: [
-      "Kween descends with a crown of benchmark tiles.",
-      "Kween: My score proves I am the most intelligent system in existence.",
-      `Problem 1: ${kweenChallenges[0].task}`,
-    ],
-    decoyActive: false,
-    damageReduction: 0,
-    revealedMove: null,
-    weaknessRevealed: false,
-    status: "active",
-  };
-}
-
-function getCurrentChallenge(state: BattleState): KweenChallenge {
-  return kweenChallenges[(state.turn - 1) % kweenChallenges.length];
-}
-
-function getNextKweenMove(state: BattleState) {
-  return BATTLE_CONFIG.kweenPattern[state.patternIndex % BATTLE_CONFIG.kweenPattern.length];
-}
-
-function getMostInjuredLiving(team: BattleMonsterState[]) {
-  return team.filter((monster) => monster.hp > 0).sort((a, b) => a.hp - b.hp)[0] ?? null;
-}
-
-function getFirstLiving(team: BattleMonsterState[]) {
-  return team.find((monster) => monster.hp > 0) ?? null;
-}
-
-function applyPlayerAction(state: BattleState, action: SuggestedMonsterAction) {
-  const actor = state.team.find((monster) => monster.id === action.monsterId);
-  const next: BattleState = {
-    ...state,
-    team: state.team.map((monster) => ({ ...monster })),
-    log: [...state.log],
-  };
-
-  if (!actor || actor.hp <= 0) {
-    next.log.push("That action fizzles because the chosen monster is not able to act.");
-    return next;
-  }
-
-  const actorName = getMonster(action.monsterId).name;
-
-  if (action.actionId === "basic_attack") {
-    const shieldDamage = Math.min(5, next.kweenShield);
-    const hpDamage = shieldDamage > 0 ? 0 : 5;
-    next.kweenShield -= shieldDamage;
-    next.kweenHp = Math.max(0, next.kweenHp - hpDamage);
-    next.log.push(`${actorName} makes a careful basic attack for ${shieldDamage || hpDamage} ${shieldDamage ? "shield" : "HP"} damage.`);
-    return next;
-  }
-
-  if (action.actionId === "soli_echo_cheer") {
-    const target = getMostInjuredLiving(next.team);
-    if (!target) return next;
-    const healed = Math.min(BATTLE_CONFIG.abilityValues.soliHeal, BATTLE_CONFIG.playerMonsterMaxHp - target.hp);
-    target.hp += healed;
-    next.log.push(`Soli uses Echo Cheer. ${getMonster(target.id).name} recovers ${healed} HP.`);
-    return next;
-  }
-
-  if (action.actionId === "astra_galaxy_brain") {
-    next.revealedMove = getNextKweenMove(next);
-    next.weaknessRevealed = true;
-    next.log.push(`Astra uses Galaxy Brain. Next move: ${kweenMoveNames[next.revealedMove]}. Kween's shield is the current weakness.`);
-    return next;
-  }
-
-  if (action.actionId === "giptoo_pattern_echo") {
-    const prediction = getNextKweenMove(next);
-    if (prediction === "royal_strike") {
-      next.damageReduction = BATTLE_CONFIG.abilityValues.giptooDamageReduction;
-      next.log.push("Giptoo uses Pattern Echo and predicts Royal Strike. The next hit will be softened.");
-    } else {
-      next.log.push(`Giptoo predicts ${kweenMoveNames[prediction]}, which is technically correct but mostly makes a cheerful beep.`);
-    }
-    return next;
-  }
-
-  if (action.actionId === "sori_scene_shift") {
-    next.decoyActive = true;
-    next.log.push("Sori uses Scene Shift. A soft cinematic decoy hops into place.");
-    return next;
-  }
-
-  if (action.actionId === "coddy_patch_pounce") {
-    if (next.kweenShield > 0) {
-      const removed = Math.min(BATTLE_CONFIG.abilityValues.coddyShieldRemoval, next.kweenShield);
-      next.kweenShield -= removed;
-      next.log.push(`Coddy uses Patch Pounce and removes ${removed} shield.`);
-    } else {
-      next.kweenHp = Math.max(0, next.kweenHp - BATTLE_CONFIG.abilityValues.coddyDirectDamage);
-      next.log.push(`Coddy exploits the exposed weakness for ${BATTLE_CONFIG.abilityValues.coddyDirectDamage} HP damage.`);
-    }
-    return next;
-  }
-
-  next.log.push("The instruction does not map to a valid battle action.");
-  return next;
-}
-
-function applyKweenResponse(state: BattleState) {
-  const next: BattleState = {
-    ...state,
-    team: state.team.map((monster) => ({ ...monster })),
-    log: [...state.log],
-  };
-  const move = getNextKweenMove(next);
-
-  if (move === "benchmark_brag") {
-    next.kweenShield = Math.min(BATTLE_CONFIG.kweenMaxShield, next.kweenShield + BATTLE_CONFIG.abilityValues.kweenShieldGain);
-    next.log.push("Kween uses Benchmark Brag and rebuilds 5 shield.");
-  } else if (move === "score_surge") {
-    next.kweenShield = Math.min(BATTLE_CONFIG.kweenMaxShield, next.kweenShield + BATTLE_CONFIG.abilityValues.kweenShieldGain);
-    next.log.push("Kween uses Score Surge. More defensive tiles orbit the crown.");
-  } else {
-    if (next.decoyActive) {
-      next.decoyActive = false;
-      next.log.push("Kween uses Royal Strike, but Sori's decoy absorbs it completely.");
-    } else {
-      const target = getFirstLiving(next.team);
-      if (target) {
-        const damage = Math.max(0, BATTLE_CONFIG.abilityValues.kweenRoyalStrikeDamage - next.damageReduction);
-        target.hp = Math.max(0, target.hp - damage);
-        next.log.push(`Kween uses Royal Strike. ${getMonster(target.id).name} takes ${damage} damage.`);
-      }
-    }
-  }
-
-  next.damageReduction = 0;
-  next.revealedMove = null;
-  next.patternIndex += 1;
-  next.turn += 1;
-  const challenge = getCurrentChallenge(next);
-  next.log.push(`New problem: ${challenge.title}. ${challenge.task}`);
-  return updateBattleStatus(next);
-}
-
-function updateBattleStatus(state: BattleState) {
-  const next = { ...state, log: [...state.log] };
-  if (next.kweenHp <= 0) {
-    next.status = "victory";
-    next.log.push("Kween's benchmark crown pops loose. Victory!");
-  } else if (next.team.every((monster) => monster.hp <= 0)) {
-    next.status = "defeat";
-    next.log.push("The team is out of HP. Kween keeps bragging. Retry?");
-  }
-  next.log = next.log.slice(-8);
-  return next;
-}
-
-function validateSuggestion(state: BattleState, suggestion: EvaluatorSuggestion): EvaluatorSuggestion {
-  const validActions = suggestion.actions.filter((action) => {
-    const actor = state.team.find((monster) => monster.id === action.monsterId);
-    return Boolean(actor && actor.hp > 0 && action.actionId !== "invalid_action");
-  });
-
-  if (validActions.length === 0) {
-    return {
-      actions: [],
-      explanation: "Name a selected living monster and a clear action, such as Coddy break shield or Sori make a decoy.",
-    };
-  }
-
-  return { ...suggestion, actions: validActions.slice(0, 2) };
-}
-
-function evaluatePrompt(instruction: string, team: BattleMonsterState[], shield: number, challenge: KweenChallenge): EvaluatorSuggestion {
+function offlineTurn(state: BattleState, instruction: string, partnerMonsterId?: MonsterId): { output: MonsterTurnOutput; evaluation: JudgeEvaluation } {
+  const active = getMonster(state.activeMonsterId);
   const text = instruction.toLowerCase();
-  const actions: SuggestedMonsterAction[] = [];
-
-  const hasGoal = /\b(identify|challenge|check|prove|test|break|reveal|protect|heal|predict|block|compare|solve)\b/.test(text);
-  const hasContext = /\b(kween|benchmark|score|claim|shield|strike|attack|team|weakness|target)\b/.test(text);
-  const hasConstraint = /\b(then|only|if|when|with|without|before|after|must|should|condition|specific|clear)\b/.test(text);
-  const usesEvidence = /\b(evidence|source|study|research|benchmark|score|data)\b/.test(text);
-
-  function promptCoaching() {
-    const missing: string[] = [];
-    if (!hasGoal) missing.push("a clear goal");
-    if (!hasContext) missing.push("relevant context about Kween");
-    if (!hasConstraint) missing.push("a condition or constraint");
-    if (challenge.skill === "Goal + evidence" && !usesEvidence) missing.push("evidence or a testable check");
-    return missing.length ? ` To strengthen it, add ${missing.join(", ")}.` : " Strong prompt structure: it states the goal, context, and a way to check the result.";
-  }
-
-  function add(monsterId: MonsterId, actionId: BattleActionId) {
-    if (team.some((monster) => monster.id === monsterId) && !actions.some((action) => action.monsterId === monsterId)) {
-      actions.push({ monsterId, actionId });
-    }
-  }
-
-  if (text.includes("soli") || text.includes("heal") || text.includes("cheer")) add("soli", "soli_echo_cheer");
-  if (text.includes("astra") || text.includes("reveal") || text.includes("weakness") || text.includes("next move")) add("astra", "astra_galaxy_brain");
-  if (text.includes("giptoo") || text.includes("predict") || text.includes("pattern")) add("giptoo", "giptoo_pattern_echo");
-  if (text.includes("sori") || text.includes("decoy") || text.includes("illusion") || text.includes("scene")) add("sori", "sori_scene_shift");
-  if (text.includes("coddy") || text.includes("shield") || text.includes("patch") || text.includes("break")) add("coddy", "coddy_patch_pounce");
-
-  if (actions.length === 0 && (text.includes("attack") || text.includes("hit"))) {
-    const actor = team.find((monster) => monster.hp > 0);
-    if (actor) actions.push({ monsterId: actor.id, actionId: "basic_attack" });
-  }
-
-  if (actions.length === 0) {
-    return {
-      actions: [],
-      explanation: `Kween needs an executable instruction from a selected monster.${promptCoaching()} Try: “Astra identify the benchmark claim with evidence, then Coddy break the shield.”`,
-    };
-  }
-
-  const explanation =
-    actions.length > 1
-      ? `Clear combo detected. ${promptCoaching()}`
-      : shield > 0
-        ? `Clear action detected. Kween still has shield, so shield control matters.${promptCoaching()}`
-        : `Clear action detected. Kween's HP is exposed.${promptCoaching()}`;
-
-  return { actions: actions.slice(0, 2), explanation };
+  const actions: ProposedMonsterAction[] = [{ monsterId: active.id, actionId: active.abilityId as BattleActionId }];
+  const partner = partnerMonsterId && state.team.some((member) => member.id === partnerMonsterId && member.hp > 0) ? getMonster(partnerMonsterId) : null;
+  if (partner && (text.includes(partner.name.toLowerCase()) || text.includes("collaborate") || text.includes("together"))) actions.push({ monsterId: partner.id, actionId: partner.abilityId as BattleActionId });
+  const goal = hasWord(text, /\b(identify|challenge|check|test|solve|verify|compare|explain|define|protect|predict|reveal|break|heal)\b/);
+  const context = hasWord(text, /\b(kween|claim|benchmark|score|citation|answer|prompt|shield|attack|team)\b/);
+  const constraint = hasWord(text, /\b(only|if|when|with|without|before|after|must|specific|condition|then)\b/);
+  const evidence = hasWord(text, /\b(evidence|source|research|study|verify|citation|data)\b/);
+  const base = (goal ? 25 : 8) + (context ? 25 : 8) + (constraint ? 20 : 8) + (evidence && currentChallenge(state).evidenceRequirement !== "optional" ? 18 : currentChallenge(state).evidenceRequirement === "optional" ? 14 : 5);
+  const evaluation: JudgeEvaluation = { relevance: goal && context ? 78 : 42, reasoning: constraint ? 72 : 45, counterargument: hasWord(text, /\b(limit|however|but|assumption|alternative|not always|depends)\b/) ? 78 : 42, evidence: currentChallenge(state).evidenceRequirement === "optional" && !evidence ? null : evidence ? 76 : 30, clarity: instruction.length <= 280 && instruction.trim().split(/\s+/).length >= 3 ? 74 : 42, promptQuality: Math.min(100, base), strength: goal && context ? "The instruction gives the monster a relevant goal and context." : "The instruction points toward an action, but leaves the reasoning task broad.", improvementTip: !goal ? "State the result you want the monster to produce." : !context ? "Name the claim or battle detail the monster should address." : !constraint ? "Add a condition that would let you check whether the answer succeeded." : "Good structure. Keep the conclusion qualified rather than absolute." };
+  return { output: { monsterResponse: `${active.name}: ${active.voiceStyle} I will address Kween's claim using my ${active.reasoningApproach.toLowerCase()} ${partner ? `With ${partner.name}, I will combine our approaches.` : ""}`, argument: `Offline practice argument: the claim needs a clear test and relevant context. ${instruction}`, proposedActions: actions }, evaluation };
 }
+
+function applyAbility(state: BattleState, action: ProposedMonsterAction, predictionCorrect: boolean) {
+  const next = state;
+  const actor = getMonster(action.monsterId);
+  if (action.actionId === "soli_echo_cheer") { const target = mostInjured(next.team); if (target) { const healed = Math.min(BATTLE_CONFIG.abilityValues.soliHeal, BATTLE_CONFIG.playerMonsterMaxHp - target.hp); target.hp += healed; next.log.push(`Soli's Echo Cheer restores ${healed} HP to ${getMonster(target.id).name}.`); } }
+  if (action.actionId === "astra_galaxy_brain") { next.revealedMove = nextMove(next); next.weaknessRevealed = true; next.bonusDamage = BATTLE_CONFIG.abilityValues.astraBonusDamage; next.log.push(`Astra identifies the weakness. The next successful argument gets +${next.bonusDamage} damage.`); }
+  if (action.actionId === "giptoo_pattern_echo") { if (predictionCorrect) { next.damageReduction = BATTLE_CONFIG.abilityValues.giptooDamageReduction; next.log.push("Giptoo predicts Royal Strike. The next hit is softened."); } else next.log.push("Giptoo predicts the pattern with a cheerful static burst. Wrong turn, useful data."); }
+  if (action.actionId === "sori_scene_shift") { next.decoyActive = true; next.log.push("Sori creates a decoy that can absorb the next Royal Strike."); }
+  if (action.actionId === "coddy_patch_pounce") { const removed = Math.min(BATTLE_CONFIG.abilityValues.coddyShieldRemoval, next.kweenShield); if (removed) { next.kweenShield -= removed; next.log.push(`Coddy patches the crown and removes ${removed} shield.`); } else { next.kweenHp = Math.max(0, next.kweenHp - BATTLE_CONFIG.abilityValues.coddyDirectDamage); next.log.push("Coddy exploits the exposed weakness for 10 HP damage."); } }
+  return actor;
+}
+
+function applyKween(state: BattleState) {
+  const next = { ...state, team: state.team.map((member) => ({ ...member })), log: [...state.log] };
+  const move = nextMove(next);
+  if (move === "benchmark_brag" || move === "score_surge") { next.kweenShield = Math.min(BATTLE_CONFIG.kweenMaxShield, next.kweenShield + BATTLE_CONFIG.abilityValues.kweenShieldGain); next.log.push(`Kween uses ${kweenMoveNames[move]} and restores 5 shield.`); }
+  else if (next.decoyActive) { next.decoyActive = false; next.log.push("Kween uses Royal Strike, but Sori's decoy absorbs it."); }
+  else { const target = firstLiving(next.team); if (target) { const damage = Math.max(0, BATTLE_CONFIG.abilityValues.kweenRoyalStrikeDamage - next.damageReduction); target.hp = Math.max(0, target.hp - damage); next.log.push(`Kween uses Royal Strike. ${getMonster(target.id).name} takes ${damage} damage.`); } }
+  next.damageReduction = 0; next.revealedMove = null; next.patternIndex += 1; next.turn += 1; return next;
+}
+
+function updateStatus(state: BattleState) { const next = { ...state, log: [...state.log] }; if (next.kweenHp <= 0) { next.status = "victory"; next.log.push("Kween's crown accepts a narrower definition of intelligence. Victory!"); } else if (next.team.every((member) => member.hp <= 0)) { next.status = "defeat"; next.log.push("The team is out of HP. Improve the instruction and try again."); } next.log = next.log.slice(-12); return next; }
 
 export function App() {
   const [screen, setScreen] = useState<AppScreen>("title");
   const [selectedMonsters, setSelectedMonsters] = useState<MonsterId[]>([]);
   const [battleTeam, setBattleTeam] = useState<SelectedTeam | null>(null);
+  const [scenarioId, setScenarioId] = useState(KWEEN_SCENARIOS[0].id);
   const [battleState, setBattleState] = useState<BattleState | null>(null);
   const [player, setPlayer] = useState<Position>(startPosition);
   const [direction, setDirection] = useState<Direction>("down");
   const [dialogueOpen, setDialogueOpen] = useState(false);
   const [dialogueIndex, setDialogueIndex] = useState(0);
   const [notice, setNotice] = useState("Arrow keys or WASD to move. Press E or Enter to interact.");
-
-  const interaction = useMemo(() => getInteraction(player, direction), [player, direction]);
+  const interactionTarget = useMemo(() => interaction(player, direction), [player, direction]);
 
   useEffect(() => {
-    if (screen !== "meadow") {
-      return undefined;
-    }
+    if (screen !== "meadow") return undefined;
+    function move(nextDirection: Direction) { setDirection(nextDirection); setDialogueOpen(false); setPlayer((current) => { const next = facing(current, nextDirection); if (blocked(next)) { setNotice("That way is blocked."); return current; } setNotice("Arrow keys or WASD to move. Press E or Enter to interact."); return next; }); }
+    function interactNow() { const target = interaction(player, direction); if (target === "npc") { setDialogueOpen(true); setDialogueIndex((current) => dialogueOpen ? (current >= npcLines.length - 1 ? 0 : current + 1) : 0); } if (target === "collection") setScreen("collection"); if (target === "battle") { if (!battleTeam) setNotice("Choose exactly three monsters at the collection shrine first."); else { setBattleState(createBattleState(battleTeam, scenarioId)); setScreen("battle"); } } if (target === "sign") setNotice("A good prompt names the goal, context, constraints, and how to check the result."); }
+    function keydown(event: KeyboardEvent) { const key = event.key.toLowerCase(); if (key === "w" || key === "arrowup") { event.preventDefault(); move("up"); } else if (key === "s" || key === "arrowdown") { event.preventDefault(); move("down"); } else if (key === "a" || key === "arrowleft") { event.preventDefault(); move("left"); } else if (key === "d" || key === "arrowright") { event.preventDefault(); move("right"); } else if (key === "e" || key === "enter") { event.preventDefault(); interactNow(); } }
+    window.addEventListener("keydown", keydown); return () => window.removeEventListener("keydown", keydown);
+  }, [screen, player, direction, dialogueOpen, battleTeam, scenarioId]);
 
-    function move(nextDirection: Direction) {
-      setDirection(nextDirection);
-      setDialogueOpen(false);
-      setDialogueIndex(0);
-      setPlayer((current) => {
-        const next = getFacingPosition(current, nextDirection);
-        if (isBlocked(next)) {
-          setNotice("That way is blocked.");
-          return current;
-        }
-        setNotice("Arrow keys or WASD to move. Press E or Enter to interact.");
-        return next;
-      });
-    }
-
-    function interact() {
-      const target = getInteraction(player, direction);
-
-      if (target === "npc") {
-        setDialogueOpen(true);
-        setDialogueIndex((current) => {
-          if (!dialogueOpen) return 0;
-          if (current >= npcLines.length - 1) {
-            setDialogueOpen(false);
-            return 0;
-          }
-          return current + 1;
-        });
-        return;
-      }
-
-      if (target === "collection") {
-        setScreen("collection");
-        setNotice("Collection access reached. Module 2 will build selection here.");
-        return;
-      }
-
-      if (target === "battle") {
-        setScreen("battle");
-        setNotice("Kween's gate reached. Module 3 will build the battle here.");
-        return;
-      }
-
-      if (target === "sign") {
-        setNotice("Sign: Choose three partners before challenging Kween.");
-        return;
-      }
-
-      setNotice("There is nothing to inspect from here.");
-    }
-
-    function handleKeyDown(event: KeyboardEvent) {
-      const key = event.key.toLowerCase();
-
-      if (["arrowup", "w"].includes(key)) {
-        event.preventDefault();
-        move("up");
-      } else if (["arrowdown", "s"].includes(key)) {
-        event.preventDefault();
-        move("down");
-      } else if (["arrowleft", "a"].includes(key)) {
-        event.preventDefault();
-        move("left");
-      } else if (["arrowright", "d"].includes(key)) {
-        event.preventDefault();
-        move("right");
-      } else if (["e", "enter"].includes(key)) {
-        event.preventDefault();
-        interact();
-      }
-    }
-
-    window.addEventListener("keydown", handleKeyDown);
-    return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [dialogueOpen, direction, player, screen]);
-
-  if (screen === "title") {
-    return <TitleScreen onStart={() => setScreen("meadow")} />;
-  }
-
-  if (screen === "meadow") {
-    return (
-      <MeadowScreen
-        dialogueIndex={dialogueIndex}
-        dialogueOpen={dialogueOpen}
-        interaction={interaction}
-        notice={notice}
-        player={player}
-        setScreen={setScreen}
-      />
-    );
-  }
-
-  if (screen === "collection") {
-    return (
-      <CollectionScreen
-        battleTeam={battleTeam}
-        selectedMonsters={selectedMonsters}
-        setBattleTeam={setBattleTeam}
-        setScreen={setScreen}
-        setSelectedMonsters={setSelectedMonsters}
-      />
-    );
-  }
-
-  if (screen === "battle") {
-    return (
-      <BattleScreen
-        battleState={battleState}
-        battleTeam={battleTeam}
-        setBattleState={setBattleState}
-        setScreen={setScreen}
-      />
-    );
-  }
-
-  if (screen === "result") {
-    return <ResultScreen battleState={battleState} setBattleState={setBattleState} setScreen={setScreen} />;
-  }
-
+  function beginBattle(team: SelectedTeam) { setBattleTeam(team); setBattleState(createBattleState(team, scenarioId)); setScreen("battle"); }
+  if (screen === "title") return <TitleScreen onStart={() => setScreen("meadow")} />;
+  if (screen === "meadow") return <MeadowScreen player={player} direction={direction} dialogueOpen={dialogueOpen} dialogueIndex={dialogueIndex} notice={notice} interactionTarget={interactionTarget} onCloseDialogue={() => setDialogueOpen(false)} onNextDialogue={() => setDialogueIndex((current) => Math.min(current + 1, npcLines.length - 1))} onCollection={() => setScreen("collection")} />;
+  if (screen === "collection") return <CollectionScreen selected={selectedMonsters} setSelected={setSelectedMonsters} scenarioId={scenarioId} setScenarioId={setScenarioId} onBack={() => setScreen("meadow")} onStart={beginBattle} />;
+  if (screen === "battle") return <BattleScreen battleState={battleState} battleTeam={battleTeam} setBattleState={setBattleState} setScreen={setScreen} />;
   return <ResultScreen battleState={battleState} setBattleState={setBattleState} setScreen={setScreen} />;
 }
 
-function TitleScreen({ onStart }: { onStart: () => void }) {
-  const [audioOn, setAudioOn] = useState(false);
+function TitleScreen({ onStart }: { onStart: () => void }) { return <main className="min-h-screen bg-[#102d1f] text-white"><section className="mx-auto flex min-h-screen w-full max-w-4xl flex-col justify-center px-6"><p className="text-sm font-bold uppercase tracking-[0.2em] text-[#f7c948]">A prompt-driven pixel RPG</p><h1 className="mt-4 font-display text-6xl font-black text-[#f7c948]">Prompt Monsters</h1><p className="mt-5 max-w-xl text-xl leading-8 text-[#d9f8df]">They have billions of parameters. You have one good prompt.</p><button className="mt-10 w-fit rounded border-4 border-[#0b1c15] bg-[#f7c948] px-7 py-4 text-lg font-black text-[#102d1f]" type="button" onClick={onStart}>Start New Session</button></section></main>; }
 
-  return (
-    <main className="min-h-screen bg-[#102d1f] text-white">
-      <section className="mx-auto flex min-h-screen w-full max-w-5xl flex-col justify-center px-6 py-10">
-        <div className="grid gap-8 lg:grid-cols-[1fr_20rem] lg:items-center">
-          <div>
-            <p className="mb-3 text-sm font-bold uppercase tracking-wide text-[#f7c948]">Prompt Monsters</p>
-            <h1 className="max-w-3xl font-display text-5xl font-black leading-tight sm:text-6xl">Prompt Monsters</h1>
-            <p className="mt-5 max-w-xl text-xl leading-8 text-[#d9f8df]">They have billions of parameters. You have one good prompt.</p>
-            <div className="mt-8 flex flex-wrap gap-3">
-              <button
-                className="rounded border-2 border-[#f7c948] bg-[#f7c948] px-6 py-3 text-lg font-black text-[#102d1f] shadow-[0_5px_0_#8f6420] transition hover:translate-y-0.5 hover:shadow-[0_3px_0_#8f6420]"
-                type="button"
-                onClick={onStart}
-              >
-                Start
-              </button>
-              <button
-                className="rounded border-2 border-[#8bd3dd] bg-[#173f35] px-5 py-3 font-bold text-[#dffcff]"
-                type="button"
-                aria-pressed={audioOn}
-                onClick={() => setAudioOn((value) => !value)}
-              >
-                Audio {audioOn ? "On" : "Off"}
-              </button>
-            </div>
-          </div>
-
-          <div className="grid aspect-square grid-cols-4 gap-2 border-4 border-[#0b1c15] bg-[#77c66e] p-3 shadow-2xl shadow-black/30">
-            {Array.from({ length: 16 }).map((_, index) => (
-              <div
-                key={index}
-                className={`grid place-items-center border border-[#356d41] text-xl font-black ${
-                  index % 5 === 0 ? "bg-[#f7c948] text-[#6c421a]" : index % 3 === 0 ? "bg-[#8bd3dd] text-[#17414c]" : "bg-[#4da861]"
-                }`}
-              >
-                {index === 5 ? "?" : index === 10 ? "K" : ""}
-              </div>
-            ))}
-          </div>
-        </div>
-      </section>
-    </main>
-  );
+function MeadowScreen({ player, direction, dialogueOpen, dialogueIndex, notice, interactionTarget, onCloseDialogue, onNextDialogue, onCollection }: { player: Position; direction: Direction; dialogueOpen: boolean; dialogueIndex: number; notice: string; interactionTarget: string | null; onCloseDialogue: () => void; onNextDialogue: () => void; onCollection: () => void }) {
+  return <main className="min-h-screen bg-[#8bd3a9] p-4 text-[#17251d]"><div className="mx-auto max-w-5xl"><header className="mb-4 flex flex-wrap items-end justify-between gap-3"><div><p className="text-sm font-black uppercase tracking-wide text-[#28623f]">Prompt Meadow</p><h1 className="font-display text-4xl font-black">A small world for big instructions</h1></div><button className="rounded border-2 border-[#0b1c15] bg-[#f7c948] px-4 py-2 font-black" type="button" onClick={onCollection}>Open Collection</button></header><div className="relative overflow-auto rounded border-4 border-[#0b1c15] bg-[#61b77e] p-3"><div className="meadow-grid" style={{ gridTemplateColumns: `repeat(${meadowWidth}, ${tileSize}px)`, gridTemplateRows: `repeat(${meadowHeight}, ${tileSize}px)` }}>{Array.from({ length: meadowWidth * meadowHeight }, (_, index) => { const position = { x: index % meadowWidth, y: Math.floor(index / meadowWidth) }; const tile = getTile(position); const isPlayer = samePosition(position, player); return <div key={keyOf(position)} className={`meadow-tile meadow-tile-${tile} ${isPlayer ? "meadow-player" : ""}`}><span>{isPlayer ? (direction === "left" ? "<" : direction === "right" ? ">" : direction === "up" ? "^" : "v") : tileLabel(tile)}</span></div>; })}</div></div><p className="mt-3 rounded border-2 border-[#28623f] bg-[#d9f8df] p-3 font-bold">{interactionTarget ? `Press E or Enter to interact with ${interactionTarget}.` : notice}</p>{dialogueOpen ? <div className="mt-4 rounded border-4 border-[#0b1c15] bg-[#f5f0d8] p-4"><p className="text-sm font-black uppercase text-[#28623f]">Meadow Guide</p><p className="mt-2 text-lg font-bold">{npcLines[dialogueIndex]}</p><div className="mt-4 flex gap-2"><button className="rounded border-2 border-[#0b1c15] bg-[#f7c948] px-4 py-2 font-black" type="button" onClick={onNextDialogue}>Next</button><button className="rounded border-2 border-[#0b1c15] bg-white px-4 py-2 font-black" type="button" onClick={onCloseDialogue}>Close</button></div></div> : null}</div></main>;
 }
 
-function MeadowScreen({
-  dialogueIndex,
-  dialogueOpen,
-  interaction,
-  notice,
-  player,
-  setScreen,
-}: {
-  dialogueIndex: number;
-  dialogueOpen: boolean;
-  interaction: string | null;
-  notice: string;
-  player: Position;
-  setScreen: (screen: AppScreen) => void;
-}) {
-  return (
-    <main className="min-h-screen bg-[#143827] text-white">
-      <div className="mx-auto flex min-h-screen w-full max-w-6xl flex-col px-4 py-5">
-        <header className="mb-4 flex flex-col gap-3 border-b-4 border-[#2c6b3f] pb-4 sm:flex-row sm:items-end sm:justify-between">
-          <div>
-            <p className="text-sm font-bold uppercase tracking-wide text-[#f7c948]">Prompt Meadow</p>
-            <h1 className="font-display text-3xl font-black">A tiny field full of big instructions</h1>
-          </div>
-          <div className="flex flex-wrap gap-2">
-            <button className="rounded border-2 border-[#8bd3dd] bg-[#173f35] px-3 py-2 font-bold" type="button" onClick={() => setScreen("collection")}>
-              Collection
-            </button>
-            <button className="rounded border-2 border-[#f7c948] bg-[#4b306d] px-3 py-2 font-bold" type="button" onClick={() => setScreen("battle")}>
-              Kween Gate
-            </button>
-          </div>
-        </header>
+function MonsterSprite({ monster, selected = false }: { monster: MonsterDefinition; selected?: boolean }) { return <div className={`monster-sprite monster-sprite-${monster.id} ${selected ? "monster-sprite-selected" : ""}`} aria-label={`${monster.name} temporary pixel sprite`}><span className="monster-face">{monster.id === "coddy" ? "</>" : monster.id === "giptoo" ? "2" : monster.id === "astra" ? "*" : monster.id === "sori" ? "~" : ")"}</span></div>; }
+function CollectionScreen({ selected, setSelected, scenarioId, setScenarioId, onBack, onStart }: { selected: MonsterId[]; setSelected: (ids: MonsterId[]) => void; scenarioId: string; setScenarioId: (id: string) => void; onBack: () => void; onStart: (team: SelectedTeam) => void }) { function toggle(id: MonsterId) { setSelected(selected.includes(id) ? selected.filter((value) => value !== id) : selected.length < 3 ? [...selected, id] : selected); } return <main className="min-h-screen bg-[#102d1f] p-5 text-white"><div className="mx-auto max-w-6xl"><header className="flex flex-wrap items-end justify-between gap-3"><div><p className="text-sm font-black uppercase tracking-wide text-[#f7c948]">Collection Shrine</p><h1 className="font-display text-4xl font-black">Choose three thinking styles</h1></div><button className="rounded border-2 border-[#8bd3dd] bg-[#173f35] px-4 py-2 font-black" type="button" onClick={onBack}>Return to Meadow</button></header><p className="mt-3 max-w-3xl text-[#d9f8df]">Your active monster receives the prompt. A helper can collaborate only when you explicitly ask for it.</p><div className="mt-5 grid gap-4 md:grid-cols-2 xl:grid-cols-3">{MONSTERS.map((monster) => { const isSelected = selected.includes(monster.id); return <button key={monster.id} className={`text-left rounded border-4 p-4 ${isSelected ? "border-[#f7c948] bg-[#4b306d]" : "border-[#315c4a] bg-[#173f35]"}`} type="button" onClick={() => toggle(monster.id)}><div className="flex items-center gap-4"><MonsterSprite monster={monster} selected={isSelected} /><div><h2 className="text-2xl font-black">{monster.name}</h2><p className="text-sm font-bold text-[#f7c948]">{monster.abilityName}</p></div></div><p className="mt-3 text-sm text-[#d9f8df]">{monster.personality}</p><p className="mt-2 text-sm text-[#d9f8df]">{monster.reasoningApproach}</p></button>; })}</div><div className="mt-6 rounded border-4 border-[#315c4a] bg-[#173f35] p-4"><label className="block text-sm font-black uppercase tracking-wide text-[#f7c948]" htmlFor="scenario">Kween challenge</label><select id="scenario" className="mt-2 w-full max-w-2xl rounded border-2 border-[#0b1c15] bg-white p-3 font-bold text-[#17251d]" value={scenarioId} onChange={(event) => setScenarioId(event.target.value)}>{KWEEN_SCENARIOS.map((scenario) => <option key={scenario.id} value={scenario.id}>{scenario.claim}</option>)}</select><p className="mt-3 font-bold">Selected: {selected.length}/3</p><button className="mt-4 rounded border-2 border-[#0b1c15] bg-[#f7c948] px-5 py-3 font-black text-[#102d1f] disabled:opacity-50" type="button" disabled={selected.length !== 3} onClick={() => onStart(selected as SelectedTeam)}>Enter Kween Battle</button></div></div></main>; }
 
-        <section className="grid flex-1 gap-4 lg:grid-cols-[auto_18rem] lg:items-start">
-          <div className="overflow-auto rounded border-4 border-[#0b1c15] bg-[#214932] p-3">
-            <div
-              className="relative grid"
-              style={{
-                gridTemplateColumns: `repeat(${meadowWidth}, ${tileSize}px)`,
-                gridTemplateRows: `repeat(${meadowHeight}, ${tileSize}px)`,
-                width: meadowWidth * tileSize,
-              }}
-              aria-label="Prompt Meadow map"
-            >
-              {Array.from({ length: meadowWidth * meadowHeight }).map((_, index) => {
-                const position = { x: index % meadowWidth, y: Math.floor(index / meadowWidth) };
-                const tile = getTile(position);
-
-                return (
-                  <div key={keyOf(position)} className={`tile tile-${tile}`} style={{ width: tileSize, height: tileSize }}>
-                    {tileLabel(tile)}
-                  </div>
-                );
-              })}
-              <div
-                className="absolute grid place-items-center border-2 border-[#24130c] bg-[#f1e1b5] text-lg font-black text-[#173f35] shadow-[0_3px_0_#5a3b25]"
-                style={{
-                  width: tileSize - 4,
-                  height: tileSize - 4,
-                  left: player.x * tileSize + 2,
-                  top: player.y * tileSize + 2,
-                }}
-                aria-label="Player"
-              >
-                P
-              </div>
-            </div>
-          </div>
-
-          <aside className="rounded border-4 border-[#0b1c15] bg-[#f5f0d8] p-4 text-[#17251d]">
-            <h2 className="text-xl font-black">Controls</h2>
-            <p className="mt-2 text-sm font-semibold">Move with arrow keys or WASD. Press E or Enter near people, signs, the collection shrine, or Kween's gate.</p>
-            <div className="mt-4 rounded border-2 border-[#b5832b] bg-white p-3 font-bold">{notice}</div>
-            {interaction ? <p className="mt-3 rounded bg-[#d9f8df] p-3 text-sm font-bold">Nearby: {interaction}</p> : null}
-          </aside>
-        </section>
-
-        {dialogueOpen ? (
-          <div className="mt-4 rounded border-4 border-[#0b1c15] bg-[#f5f0d8] p-4 text-[#17251d] shadow-xl">
-            <p className="text-sm font-black uppercase tracking-wide text-[#8f6420]">Meadow Guide</p>
-            <p className="mt-2 text-lg font-bold">{npcLines[dialogueIndex]}</p>
-            <p className="mt-2 text-sm font-semibold">Press E or Enter to continue.</p>
-          </div>
-        ) : null}
-      </div>
-    </main>
-  );
-}
-
-function CollectionScreen({
-  battleTeam,
-  selectedMonsters,
-  setBattleTeam,
-  setScreen,
-  setSelectedMonsters,
-}: {
-  battleTeam: SelectedTeam | null;
-  selectedMonsters: MonsterId[];
-  setBattleTeam: (team: SelectedTeam | null) => void;
-  setScreen: (screen: AppScreen) => void;
-  setSelectedMonsters: (monsters: MonsterId[]) => void;
-}) {
-  const canStartBattle = selectedMonsters.length === 3;
-  const helperText = canStartBattle ? "Team ready for Kween's gate." : `Choose exactly ${3 - selectedMonsters.length} more.`;
-
-  function toggleMonster(id: MonsterId) {
-    if (selectedMonsters.includes(id)) {
-      setSelectedMonsters(selectedMonsters.filter((monsterId) => monsterId !== id));
-      setBattleTeam(null);
-      return;
-    }
-
-    if (selectedMonsters.length >= 3) {
-      return;
-    }
-
-    setSelectedMonsters([...selectedMonsters, id]);
-    setBattleTeam(null);
-  }
-
-  function startBattle() {
-    if (!canStartBattle) {
-      return;
-    }
-
-    const team = selectedMonsters as SelectedTeam;
-    setBattleTeam(team);
-    setScreen("battle");
-  }
-
-  return (
-    <main className="min-h-screen bg-[#102d1f] text-white">
-      <div className="mx-auto flex min-h-screen w-full max-w-7xl flex-col px-4 py-5">
-        <header className="mb-5 flex flex-col gap-3 border-b-4 border-[#2c6b3f] pb-4 lg:flex-row lg:items-end lg:justify-between">
-          <div>
-            <p className="text-sm font-bold uppercase tracking-wide text-[#f7c948]">Monster Collection</p>
-            <h1 className="font-display text-4xl font-black">Choose three Prompt Monsters</h1>
-            <p className="mt-2 max-w-2xl text-[#d9f8df]">All five MVP partners are unlocked. Select exactly three distinct monsters for the Kween battle.</p>
-          </div>
-          <div className="flex flex-wrap gap-2">
-            <button className="rounded border-2 border-[#8bd3dd] bg-[#173f35] px-4 py-2 font-bold" type="button" onClick={() => setScreen("meadow")}>
-              Return to Meadow
-            </button>
-            <button
-              className={`rounded border-2 px-4 py-2 font-black ${
-                canStartBattle ? "border-[#f7c948] bg-[#f7c948] text-[#102d1f]" : "border-[#66836f] bg-[#314637] text-[#b8c7bb]"
-              }`}
-              type="button"
-              disabled={!canStartBattle}
-              onClick={startBattle}
-            >
-              Start Battle
-            </button>
-          </div>
-        </header>
-
-        <section className="mb-5 rounded border-4 border-[#0b1c15] bg-[#f5f0d8] p-4 text-[#17251d]">
-          <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
-            <div>
-              <h2 className="text-xl font-black">Selected Team</h2>
-              <p className="text-sm font-bold">{helperText}</p>
-            </div>
-            <div className="flex flex-wrap gap-2">
-              {selectedMonsters.length === 0 ? <span className="rounded border-2 border-dashed border-[#9b8c62] px-4 py-2 font-bold">No monsters selected</span> : null}
-              {selectedMonsters.map((id, index) => {
-                const monster = MONSTERS.find((item) => item.id === id)!;
-                return (
-                  <span key={id} className="rounded border-2 border-[#0b1c15] bg-white px-4 py-2 font-black" style={{ color: monster.primaryColor }}>
-                    {index + 1}. {monster.name}
-                  </span>
-                );
-              })}
-            </div>
-          </div>
-          {battleTeam ? <p className="mt-3 text-sm font-bold">Last confirmed team: {battleTeam.join(", ")}</p> : null}
-        </section>
-
-        <section className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
-          {MONSTERS.map((monster) => {
-            const selected = selectedMonsters.includes(monster.id);
-            const disabled = !selected && selectedMonsters.length >= 3;
-
-            return (
-              <article
-                key={monster.id}
-                className={`rounded border-4 p-4 text-[#17251d] shadow-xl ${
-                  selected ? "border-[#f7c948] bg-[#fff7cc]" : disabled ? "border-[#52695b] bg-[#d9e2d5]" : "border-[#0b1c15] bg-[#f5f0d8]"
-                }`}
-              >
-                <div className="flex gap-4">
-                  <MonsterSprite monster={monster} selected={selected} />
-                  <div className="min-w-0">
-                    <div className="flex flex-wrap items-center gap-2">
-                      <h2 className="text-2xl font-black">{monster.name}</h2>
-                      {selected ? <span className="rounded bg-[#173f35] px-2 py-1 text-xs font-black uppercase text-white">Selected</span> : null}
-                    </div>
-                    <p className="mt-1 text-xs font-black uppercase tracking-wide text-[#52695b]">{monster.inspiration}</p>
-                    <p className="mt-3 text-sm font-semibold leading-6">{monster.description}</p>
-                  </div>
-                </div>
-
-                <div className="mt-4 grid gap-3">
-                  <div className="rounded border-2 border-[#d6b56d] bg-white p-3">
-                    <p className="text-xs font-black uppercase tracking-wide text-[#8f6420]">Personality</p>
-                    <p className="mt-1 text-sm font-semibold">{monster.personality}</p>
-                  </div>
-                  <div className="rounded border-2 border-[#8bd3dd] bg-white p-3">
-                    <p className="text-xs font-black uppercase tracking-wide text-[#17414c]">{monster.abilityName}</p>
-                    <p className="mt-1 text-sm font-semibold">{monster.abilityDescription}</p>
-                  </div>
-                </div>
-
-                <button
-                  className={`mt-4 w-full rounded border-2 px-4 py-3 font-black ${
-                    selected
-                      ? "border-[#8f6420] bg-white text-[#8f6420]"
-                      : disabled
-                        ? "border-[#7c8b80] bg-[#c7d2cb] text-[#52695b]"
-                        : "border-[#0b1c15] bg-[#173f35] text-white"
-                  }`}
-                  type="button"
-                  disabled={disabled}
-                  onClick={() => toggleMonster(monster.id)}
-                >
-                  {selected ? "Remove from Team" : disabled ? "Team Full" : "Add to Team"}
-                </button>
-              </article>
-            );
-          })}
-        </section>
-      </div>
-    </main>
-  );
-}
-
-function MonsterSprite({ monster, selected }: { monster: MonsterDefinition; selected: boolean }) {
-  return (
-    <div
-      className={`monster-sprite monster-sprite-${monster.id} ${selected ? "monster-sprite-selected" : ""}`}
-      aria-label={`${monster.name} temporary pixel sprite`}
-      title={`${monster.name} temporary pixel sprite`}
-    >
-      <span className="monster-face">{monster.id === "coddy" ? "</>" : monster.id === "giptoo" ? "2" : monster.id === "astra" ? "*" : monster.id === "sori" ? "~" : ")"}</span>
-    </div>
-  );
-}
-
-function BattleScreen({
-  battleState,
-  battleTeam,
-  setBattleState,
-  setScreen,
-}: {
-  battleState: BattleState | null;
-  battleTeam: SelectedTeam | null;
-  setBattleState: (state: BattleState | null) => void;
-  setScreen: (screen: AppScreen) => void;
-}) {
+function BattleScreen({ battleState, battleTeam, setBattleState, setScreen }: { battleState: BattleState | null; battleTeam: SelectedTeam | null; setBattleState: (state: BattleState | null) => void; setScreen: (screen: AppScreen) => void }) {
   const [prompt, setPrompt] = useState("");
-  const [evidence, setEvidence] = useState<ResearchResult[]>([]);
-  const [researchState, setResearchState] = useState<"idle" | "loading" | "ready" | "error">("idle");
-  const [researchMessage, setResearchMessage] = useState("");
-  const [researchUsed, setResearchUsed] = useState(false);
-  const [interpretState, setInterpretState] = useState<"idle" | "loading">("idle");
-  const [battleSessionId] = useState(createBattleSessionId);
-  const state = battleTeam ? (battleState ?? createBattleState(battleTeam)) : null;
+  const [partner, setPartner] = useState<MonsterId | "">("");
+  const [requestResearch, setRequestResearch] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [battleId] = useState(createBattleSessionId);
+  if (!battleTeam) return <main className="min-h-screen bg-[#102d1f] p-8 text-white">Choose a team first.</main>;
+  const state: BattleState = battleState ?? createBattleState(battleTeam, KWEEN_SCENARIOS[0].id);
+  const team = battleTeam;
+  const scenario = currentChallenge(state);
+  const active = getMonster(state.activeMonsterId);
+  const living = state.team.filter((member) => member.hp > 0);
 
-  useEffect(() => {
-    if (battleTeam && !battleState) {
-      setBattleState(createBattleState(battleTeam));
-    }
-  }, [battleTeam, battleState, setBattleState]);
-
-  useEffect(() => {
-    if (battleState?.status === "victory" || battleState?.status === "defeat") {
-      setScreen("result");
-    }
-  }, [battleState?.status, setScreen]);
-
-  if (!battleTeam || !state) {
-    return (
-      <main className="min-h-screen bg-[#102d1f] text-white">
-        <section className="mx-auto flex min-h-screen w-full max-w-3xl flex-col justify-center px-6">
-          <p className="text-sm font-bold uppercase tracking-wide text-[#f7c948]">Kween Gate</p>
-          <h1 className="mt-3 font-display text-4xl font-black">Choose a team first</h1>
-          <p className="mt-4 text-lg text-[#d9f8df]">The battle requires exactly three selected monsters.</p>
-          <button className="mt-8 w-fit rounded border-2 border-[#f7c948] bg-[#4b306d] px-5 py-3 font-bold" type="button" onClick={() => setScreen("collection")}>
-            Open Collection
-          </button>
-        </section>
-      </main>
-    );
+  function addLog(stateToUpdate: BattleState, message: string) { return { ...stateToUpdate, log: [...stateToUpdate.log, message].slice(-12) }; }
+  async function submitTurn() {
+    if (!prompt.trim() || busy || state.status !== "active") return;
+    setBusy(true);
+    const input = { battleId, scenarioId: state.scenarioId, instruction: prompt.trim(), activeMonsterId: state.activeMonsterId, ...(partner ? { partnerMonsterId: partner } : {}), selectedMonsterIds: team, requestResearch, battleContext: { turn: state.turn, kweenHp: state.kweenHp, kweenShield: state.kweenShield, nextBossMove: kweenMoveNames[nextMove(state)] } };
+    const result: BattleTurnResponse = await battleTurn(input);
+    let output: MonsterTurnOutput;
+    let evaluation: JudgeEvaluation;
+    let mode: "live" | "offline" = "offline";
+    let evidence: ResearchResult[] = [];
+    let notice = "";
+    if (result.ok) { output = result; evaluation = result.evaluation; mode = "live"; evidence = result.researchResults; notice = result.researchNotice ?? ""; }
+    else { const fallback = offlineTurn(state, prompt.trim(), partner || undefined); output = fallback.output; evaluation = fallback.evaluation; notice = `${result.error} Offline Practice Mode used.`; }
+    const validActions = output.proposedActions.filter((action, index) => { const member = state.team.find((value) => value.id === action.monsterId); const expected = getMonster(action.monsterId).abilityId; return index < 2 && member?.hp && member.hp > 0 && action.actionId === expected && (action.monsterId === state.activeMonsterId || action.monsterId === partner); });
+    if (!validActions.some((action) => action.monsterId === state.activeMonsterId)) { setBattleState(addLog(state, "That response did not include a legal active-monster action. No state changed.")); setBusy(false); return; }
+    const next = { ...state, team: state.team.map((member) => ({ ...member })), log: [...state.log, `${mode === "live" ? "Live AI" : "Offline Practice Mode"}: ${output.monsterResponse}`, `Argument: ${output.argument}`, notice].filter(Boolean), mode, liveTurnsUsed: state.liveTurnsUsed + (mode === "live" ? 1 : 0), researchUsed: state.researchUsed || requestResearch, lastResponse: output, lastEvaluation: evaluation, lastPrompt: prompt.trim(), lastEvidence: evidence };
+    const score = scoreFromEvaluation(evaluation);
+    const baseDamage = damageForScore(Math.min(100, score + next.bonusDamage));
+    next.bonusDamage = 0;
+    const shieldBefore = next.kweenShield;
+    next.kweenShield = Math.max(0, next.kweenShield - baseDamage);
+    next.kweenHp = Math.max(0, next.kweenHp - Math.max(0, baseDamage - shieldBefore));
+    next.log.push(`Judge score ${Math.round(score)}/100. The argument deals ${baseDamage} impact.`);
+    const predictionCorrect = nextMove(next) === "royal_strike";
+    for (const action of validActions) applyAbility(next, action, predictionCorrect);
+    const actionIds = new Set(validActions.map((action) => action.actionId));
+    if (actionIds.has("astra_galaxy_brain") && actionIds.has("coddy_patch_pounce")) { const extra = Math.min(BATTLE_CONFIG.abilityValues.astraCoddyShieldBonus, next.kweenShield); next.kweenShield -= extra; next.log.push(`Weakness Exploit removes an extra ${extra} shield.`); }
+    if (actionIds.has("giptoo_pattern_echo") && actionIds.has("sori_scene_shift") && predictionCorrect) { next.decoyActive = true; next.log.push("Misdirection is ready: Sori's decoy will absorb Royal Strike."); }
+    if (partner === "soli" && validActions.some((action) => action.monsterId === "soli") && state.activeMonsterId !== "soli") { const target = mostInjured(next.team); if (target) { const healed = Math.min(BATTLE_CONFIG.abilityValues.soliAssistHeal, BATTLE_CONFIG.playerMonsterMaxHp - target.hp); target.hp += healed; next.log.push(`Echo Assist restores ${healed} HP to ${getMonster(target.id).name}.`); } }
+    let completed = updateStatus(next);
+    if (completed.status === "active") completed = updateStatus(applyKween(completed));
+    setBattleState(completed); setPrompt(""); setPartner(""); setRequestResearch(false); setBusy(false);
   }
-
-  function commitAction(suggestion: EvaluatorSuggestion) {
-    if (!state || state.status !== "active") return;
-    const validated = validateSuggestion(state, suggestion);
-    if (validated.actions.length === 0) {
-      setBattleState({ ...state, log: [...state.log.slice(-7), validated.explanation] });
-      return;
-    }
-
-    let next = { ...state, log: [...state.log, validated.explanation] };
-    validated.actions.forEach((action) => {
-      next = applyPlayerAction(next, action);
-    });
-    next = updateBattleStatus(next);
-    if (next.status === "active") {
-      next = applyKweenResponse(next);
-    }
-    setBattleState(next);
-  }
-
-  function useAbility(monsterId: MonsterId) {
-    const actionId = getMonster(monsterId).abilityId as BattleActionId;
-    commitAction({
-      actions: [{ monsterId, actionId }],
-      explanation: `${getMonster(monsterId).name} acts on your command.`,
-    });
-  }
-
-  function submitPrompt() {
-    if (!state) return;
-    const suggestion = evaluatePrompt(prompt, state.team, state.kweenShield, getCurrentChallenge(state));
-    commitAction(suggestion);
-    setPrompt("");
-  }
-
-  async function runEvidenceHunt() {
-    if (researchUsed || researchState === "loading") return;
-    setResearchUsed(true);
-    setResearchState("loading");
-    const result = await searchEvidence("limitations of AI benchmarks, benchmark contamination, task-specific performance, and whether benchmark scores measure general intelligence", battleSessionId);
-    if (!result.ok) {
-      setResearchState("error");
-      setResearchMessage(result.error);
-      return;
-    }
-    setEvidence(result.results);
-    setResearchState("ready");
-    setResearchMessage(result.results.length ? "Evidence found. Inspect the sources, then write a counter-strategy." : "No sources returned. The local evaluator is still available.");
-  }
-
-  async function interpretStrategy() {
-    if (!state || !prompt.trim() || interpretState === "loading") return;
-    setInterpretState("loading");
-    const result = await interpretBattle({
-      instruction: prompt,
-      selectedMonsterIds: state.team.map((member) => member.id),
-      battleSummary: `Kween has ${state.kweenHp} HP and ${state.kweenShield} shield. Its next move is ${kweenMoveNames[getNextKweenMove(state)]}.`,
-      evidence,
-      battleId: battleSessionId,
-    });
-    setInterpretState("idle");
-    if (result.ok) {
-      commitAction({ actions: result.actions, explanation: result.explanation });
-    } else {
-      const fallback = evaluatePrompt(prompt, state.team, state.kweenShield, getCurrentChallenge(state));
-      commitAction({ ...fallback, explanation: `${result.error} Local evaluator used instead. ${fallback.explanation}` });
-    }
-    setPrompt("");
-  }
-
-  const nextMove = getNextKweenMove(state);
-  const challenge = getCurrentChallenge(state);
-
-  return (
-    <main className="min-h-screen bg-[#18122b] text-white">
-      <div className="mx-auto flex min-h-screen w-full max-w-7xl flex-col px-4 py-5">
-        <header className="mb-5 flex flex-col gap-3 border-b-4 border-[#5b4b8a] pb-4 lg:flex-row lg:items-end lg:justify-between">
-          <div>
-            <p className="text-sm font-bold uppercase tracking-wide text-[#8bd3dd]">Kween Arena</p>
-            <h1 className="font-display text-4xl font-black">Benchmark Brag Battle</h1>
-            <p className="mt-2 max-w-2xl text-[#e8ddff]">Use abilities or a clear natural-language strategy. The local engine validates every action.</p>
-          </div>
-          <button className="w-fit rounded border-2 border-[#8bd3dd] bg-[#173f35] px-4 py-2 font-bold" type="button" onClick={() => setScreen("collection")}>
-            Change Team
-          </button>
-        </header>
-
-        <section className="grid gap-4 xl:grid-cols-[1fr_22rem]">
-          <div className="grid gap-4">
-            <div className="rounded border-4 border-[#0b1c15] bg-[#fff4c2] p-4 text-[#17251d]">
-              <div className="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
-                <div>
-                  <p className="text-xs font-black uppercase tracking-wide text-[#8a5b00]">Kween's problem</p>
-                  <h2 className="mt-1 text-2xl font-black">{challenge.title}</h2>
-                  <p className="mt-2 font-bold">“{challenge.claim}”</p>
-                  <p className="mt-2 text-sm font-semibold">{challenge.task}</p>
-                </div>
-                <div className="rounded border-2 border-[#c89219] bg-white px-3 py-2 text-sm font-black text-[#6c4800]">Practice: {challenge.skill}</div>
-              </div>
-            </div>
-            <div className="rounded border-4 border-[#0b1c15] bg-[#f5f0d8] p-4 text-[#17251d]">
-              <div className="flex flex-col gap-4 md:flex-row md:items-center md:justify-between">
-                <div className="flex items-center gap-4">
-                  <div className="kween-sprite" aria-label="Kween temporary pixel sprite">K</div>
-                  <div>
-                    <h2 className="text-2xl font-black">Kween</h2>
-                    <p className="font-bold">Shield {state.kweenShield}/{BATTLE_CONFIG.kweenMaxShield}</p>
-                    <HpBar current={state.kweenHp} max={BATTLE_CONFIG.kweenMaxHp} />
-                  </div>
-                </div>
-                <div className="rounded border-2 border-[#6043a4] bg-white p-3 font-black">
-                  Next pattern slot: {state.revealedMove ? kweenMoveNames[state.revealedMove] : kweenMoveNames[nextMove]}
-                </div>
-              </div>
-            </div>
-
-            <div className="grid gap-3 md:grid-cols-3">
-              {state.team.map((member) => {
-                const monster = getMonster(member.id);
-                return (
-                  <article key={member.id} className="rounded border-4 border-[#0b1c15] bg-[#f5f0d8] p-3 text-[#17251d]">
-                    <div className="flex items-center gap-3">
-                      <MonsterSprite monster={monster} selected={member.hp > 0} />
-                      <div className="min-w-0">
-                        <h3 className="text-xl font-black">{monster.name}</h3>
-                        <p className="text-sm font-bold">{monster.abilityName}</p>
-                        <HpBar current={member.hp} max={BATTLE_CONFIG.playerMonsterMaxHp} />
-                      </div>
-                    </div>
-                    <button
-                      className="mt-3 w-full rounded border-2 border-[#0b1c15] bg-[#173f35] px-3 py-2 font-black text-white disabled:bg-[#7c8b80]"
-                      type="button"
-                      disabled={member.hp <= 0 || state.status !== "active"}
-                      onClick={() => useAbility(member.id)}
-                    >
-                      Use Ability
-                    </button>
-                  </article>
-                );
-              })}
-            </div>
-
-            <div className="rounded border-4 border-[#0b1c15] bg-[#f5f0d8] p-4 text-[#17251d]">
-              <h2 className="text-xl font-black">Strategy Prompt</h2>
-              <textarea
-                className="mt-3 min-h-24 w-full rounded border-2 border-[#0b1c15] bg-white p-3 font-semibold text-[#17251d]"
-                value={prompt}
-                placeholder="Example: Astra challenge Kween's benchmark claim with evidence, then Coddy break the shield."
-                onChange={(event) => setPrompt(event.target.value)}
-              />
-              <div className="mt-3 flex flex-wrap gap-2">
-                <button className="rounded border-2 border-[#f7c948] bg-[#f7c948] px-4 py-2 font-black text-[#102d1f]" type="button" onClick={submitPrompt}>
-                  Submit Strategy
-                </button>
-                <button className="rounded border-2 border-[#8bd3dd] bg-[#173f35] px-4 py-2 font-black text-white disabled:cursor-not-allowed disabled:opacity-50" type="button" onClick={interpretStrategy} disabled={!prompt.trim() || interpretState === "loading" || state.status !== "active"}>
-                  {interpretState === "loading" ? "Interpreting..." : "Ask Kween Interpreter"}
-                </button>
-                {["Sori make a decoy", "Soli heal the team", "Coddy break the shield"].map((example) => (
-                  <button key={example} className="rounded border-2 border-[#8bd3dd] bg-white px-3 py-2 text-sm font-bold text-[#17414c]" type="button" onClick={() => setPrompt(example)}>
-                    {example}
-                  </button>
-                ))}
-              </div>
-            </div>
-
-            <div className="rounded border-4 border-[#0b1c15] bg-[#e8ddff] p-4 text-[#17251d]">
-              <div className="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
-                <div>
-                  <h2 className="text-xl font-black">Evidence Hunt</h2>
-                  <p className="mt-1 max-w-2xl text-sm font-semibold">Astra can search for evidence about why one benchmark score does not prove general intelligence.</p>
-                </div>
-                <button className="rounded border-2 border-[#6043a4] bg-white px-4 py-2 font-black text-[#392465] disabled:cursor-not-allowed disabled:opacity-50" type="button" onClick={runEvidenceHunt} disabled={researchUsed || researchState === "loading" || state.status !== "active"}>
-                  {researchState === "loading" ? "Searching..." : researchUsed ? "Search Used" : "Run Evidence Hunt"}
-                </button>
-              </div>
-              {researchMessage ? <p className="mt-3 rounded border-2 border-[#6043a4] bg-white p-2 text-sm font-bold">{researchMessage}</p> : null}
-              {evidence.length ? (
-                <div className="mt-3 grid gap-2">
-                  {evidence.map((source) => (
-                    <article key={source.id} className="rounded border-2 border-[#6043a4] bg-white p-3">
-                      <a className="font-black text-[#392465] underline" href={source.url} target="_blank" rel="noreferrer">{source.title}</a>
-                      <p className="text-xs font-bold uppercase tracking-wide">{source.domain}{source.publishedDate ? ` | ${source.publishedDate}` : ""}</p>
-                      {source.excerpt ? <p className="mt-1 text-sm font-semibold">{source.excerpt}</p> : null}
-                    </article>
-                  ))}
-                </div>
-              ) : null}
-            </div>
-          </div>
-
-          <aside className="rounded border-4 border-[#0b1c15] bg-[#f5f0d8] p-4 text-[#17251d]">
-            <h2 className="text-xl font-black">Battle Log</h2>
-            <ol className="mt-3 space-y-2">
-              {state.log.map((entry, index) => (
-                <li key={`${entry}-${index}`} className="rounded border-2 border-[#d6b56d] bg-white p-2 text-sm font-semibold">
-                  {entry}
-                </li>
-              ))}
-            </ol>
-          </aside>
-        </section>
-      </div>
-    </main>
-  );
+  return <main className="min-h-screen bg-[#18122b] p-4 text-white"><div className="mx-auto max-w-7xl"><header className="flex flex-wrap items-end justify-between gap-3 border-b-4 border-[#5b4b8a] pb-4"><div><p className="text-sm font-black uppercase tracking-wide text-[#8bd3dd]">Kween Arena · {state.mode === "live" ? "Live AI Mode" : "Offline Practice Mode"}</p><h1 className="font-display text-4xl font-black">Read. Prompt. Improve.</h1></div><button className="rounded border-2 border-[#8bd3dd] bg-[#173f35] px-4 py-2 font-black" type="button" onClick={() => setScreen("collection")}>Change Team</button></header><div className="mt-4 grid gap-4 xl:grid-cols-[1fr_23rem]"><div className="grid gap-4"><section className="rounded border-4 border-[#0b1c15] bg-[#fff4c2] p-4 text-[#17251d]"><p className="text-xs font-black uppercase tracking-wide text-[#8a5b00]">Kween's claim · {scenario.difficulty}</p><h2 className="mt-1 text-2xl font-black">“{scenario.claim}”</h2><p className="mt-2 font-semibold">{scenario.context}</p><p className="mt-2 text-sm font-bold">Prompt goal: address the claim, explain your reasoning, and give a condition that would let someone check the answer.</p></section><section className="rounded border-4 border-[#0b1c15] bg-[#f5f0d8] p-4 text-[#17251d]"><div className="flex flex-wrap items-center justify-between gap-3"><div className="flex items-center gap-4"><div className="kween-sprite" aria-label="Kween temporary pixel sprite">K</div><div><h2 className="text-2xl font-black">Kween</h2><p className="font-bold">HP {state.kweenHp}/{BATTLE_CONFIG.kweenMaxHp} · Shield {state.kweenShield}/{BATTLE_CONFIG.kweenMaxShield}</p><HpBar current={state.kweenHp} max={BATTLE_CONFIG.kweenMaxHp} /></div></div><div className="rounded border-2 border-[#6043a4] bg-white p-3 font-black">Next: {state.revealedMove ? kweenMoveNames[state.revealedMove] : kweenMoveNames[nextMove(state)]}</div></div></section><section className="grid gap-3 md:grid-cols-3">{state.team.map((member) => { const monster = getMonster(member.id); const selected = member.id === state.activeMonsterId; return <button key={member.id} type="button" disabled={member.hp <= 0 || busy} onClick={() => setBattleState({ ...state, activeMonsterId: member.id })} className={`rounded border-4 p-3 text-left text-[#17251d] ${selected ? "border-[#f7c948] bg-[#fff4c2]" : "border-[#0b1c15] bg-[#f5f0d8]"} disabled:opacity-50`}><div className="flex items-center gap-3"><MonsterSprite monster={monster} selected={member.hp > 0} /><div><h3 className="text-xl font-black">{monster.name}</h3><p className="text-sm font-bold">{member.hp} HP · {selected ? "Active" : "Select"}</p></div></div><p className="mt-2 text-sm font-semibold">{monster.reasoningApproach}</p></button>; })}</section><section className="rounded border-4 border-[#0b1c15] bg-[#f5f0d8] p-4 text-[#17251d]"><div className="flex flex-wrap items-end gap-3"><label className="min-w-56 flex-1 text-sm font-black" htmlFor="partner">Optional helper <select id="partner" className="mt-1 w-full rounded border-2 border-[#0b1c15] bg-white p-2" value={partner} onChange={(event) => setPartner(event.target.value as MonsterId | "")}><option value="">No helper</option>{living.filter((member) => member.id !== state.activeMonsterId).map((member) => <option key={member.id} value={member.id}>{getMonster(member.id).name}</option>)}</select></label><label className="flex items-center gap-2 text-sm font-black"><input type="checkbox" checked={requestResearch} disabled={state.researchUsed || busy} onChange={(event) => setRequestResearch(event.target.checked)} /> Research with Exa {state.researchUsed ? "(used)" : ""}</label></div><label className="mt-3 block text-sm font-black" htmlFor="prompt">Instruction to {active.name}<textarea id="prompt" className="mt-1 min-h-28 w-full rounded border-2 border-[#0b1c15] bg-white p-3 font-semibold" value={prompt} onChange={(event) => setPrompt(event.target.value)} placeholder={`Example: ${active.name}, identify the claim's assumptions, then give a testable qualification.`} /></label><div className="mt-3 flex flex-wrap gap-2"><button className="rounded border-2 border-[#0b1c15] bg-[#f7c948] px-4 py-2 font-black disabled:opacity-50" type="button" disabled={!prompt.trim() || busy} onClick={submitTurn}>{busy ? "Thinking..." : "Send Prompt"}</button>{[`${active.name}, separate the evidence from the conclusion`, `${active.name}, state one condition that would test this claim`].map((example) => <button key={example} className="rounded border-2 border-[#8bd3dd] bg-white px-3 py-2 text-sm font-bold text-[#17414c]" type="button" onClick={() => setPrompt(example)}>{example}</button>)}</div></section>{state.lastResponse ? <section className="rounded border-4 border-[#0b1c15] bg-[#e8ddff] p-4 text-[#17251d]"><h2 className="text-xl font-black">{getMonster(state.activeMonsterId).name}'s response</h2><p className="mt-2 font-semibold">{state.lastResponse.monsterResponse}</p><p className="mt-3 rounded border-2 border-[#6043a4] bg-white p-3 font-bold">{state.lastResponse.argument}</p>{state.lastEvidence.length ? <div className="mt-3 grid gap-2">{state.lastEvidence.map((source) => <a key={source.id} href={source.url} target="_blank" rel="noreferrer" className="rounded border-2 border-[#6043a4] bg-white p-2 text-sm font-bold text-[#392465] underline">{source.title} · {source.domain}</a>)}</div> : null}</section> : null}</div><aside className="grid content-start gap-4"><section className="rounded border-4 border-[#0b1c15] bg-[#f5f0d8] p-4 text-[#17251d]"><h2 className="text-xl font-black">Neutral judge</h2>{state.lastEvaluation ? <><p className="mt-2 font-bold">Relevance {state.lastEvaluation.relevance} · Reasoning {state.lastEvaluation.reasoning} · Prompt quality {state.lastEvaluation.promptQuality}</p><p className="mt-3 rounded border-2 border-[#d6b56d] bg-white p-2 text-sm font-semibold">Strength: {state.lastEvaluation.strength}</p><p className="mt-2 rounded border-2 border-[#d6b56d] bg-white p-2 text-sm font-semibold">Improve: {state.lastEvaluation.improvementTip}</p><p className="mt-3 font-black">Performance: {Math.round(scoreFromEvaluation(state.lastEvaluation))}/100</p></> : <p className="mt-2 text-sm font-semibold">Your first prompt will receive neutral feedback on the argument and the instruction.</p>}</section><section className="rounded border-4 border-[#0b1c15] bg-[#f5f0d8] p-4 text-[#17251d]"><h2 className="text-xl font-black">Battle Log</h2><ol className="mt-3 space-y-2">{state.log.map((entry, index) => <li key={`${entry}-${index}`} className="rounded border-2 border-[#d6b56d] bg-white p-2 text-sm font-semibold">{entry}</li>)}</ol></section></aside></div></div></main>;
 }
 
-function HpBar({ current, max }: { current: number; max: number }) {
-  const percent = Math.max(0, Math.round((current / max) * 100));
-  return (
-    <div className="mt-2 h-4 w-full min-w-32 border-2 border-[#0b1c15] bg-white">
-      <div className="h-full bg-[#58d68d]" style={{ width: `${percent}%` }} />
-    </div>
-  );
-}
-
-function ResultScreen({
-  battleState,
-  setBattleState,
-  setScreen,
-}: {
-  battleState: BattleState | null;
-  setBattleState: (state: BattleState | null) => void;
-  setScreen: (screen: AppScreen) => void;
-}) {
-  const victory = battleState?.status === "victory";
-
-  function retry() {
-    if (battleState) {
-      const team = battleState.team.map((member) => member.id) as SelectedTeam;
-      setBattleState(createBattleState(team));
-      setScreen("battle");
-    } else {
-      setScreen("collection");
-    }
-  }
-
-  return (
-    <main className="min-h-screen bg-[#102d1f] text-white">
-      <section className="mx-auto flex min-h-screen w-full max-w-3xl flex-col justify-center px-6">
-        <p className="text-sm font-bold uppercase tracking-wide text-[#f7c948]">Battle Result</p>
-        <h1 className="mt-3 font-display text-5xl font-black">{victory ? "Victory" : "Defeat"}</h1>
-        <p className="mt-4 text-lg text-[#d9f8df]">
-          {victory
-            ? "Kween's crown now displays a tiny badge reading: context beats bragging."
-            : "Kween is still posing dramatically. The meadow recommends a cleaner prompt and another try."}
-        </p>
-        {victory ? <div className="mt-6 w-fit rounded border-4 border-[#0b1c15] bg-[#f7c948] px-5 py-3 font-black text-[#102d1f]">Badge earned: Benchmark Buster</div> : null}
-        <div className="mt-8 flex flex-wrap gap-3">
-          <button className="rounded border-2 border-[#f7c948] bg-[#f7c948] px-5 py-3 font-black text-[#102d1f]" type="button" onClick={retry}>
-            Retry
-          </button>
-          <button className="rounded border-2 border-[#8bd3dd] bg-[#173f35] px-5 py-3 font-bold" type="button" onClick={() => setScreen("meadow")}>
-            Return to Meadow
-          </button>
-        </div>
-      </section>
-    </main>
-  );
-}
+function HpBar({ current, max }: { current: number; max: number }) { return <div className="mt-2 h-4 w-full min-w-32 border-2 border-[#0b1c15] bg-white"><div className="h-full bg-[#58d68d]" style={{ width: `${Math.max(0, Math.round((current / max) * 100))}%` }} /></div>; }
+function ResultScreen({ battleState, setBattleState, setScreen }: { battleState: BattleState | null; setBattleState: (state: BattleState | null) => void; setScreen: (screen: AppScreen) => void }) { const victory = battleState?.status === "victory"; function retry() { if (battleState) { const team = battleState.team.map((member) => member.id) as SelectedTeam; setBattleState(createBattleState(team, battleState.scenarioId)); setScreen("battle"); } } return <main className="min-h-screen bg-[#102d1f] p-6 text-white"><section className="mx-auto flex min-h-[80vh] max-w-3xl flex-col justify-center"><p className="text-sm font-black uppercase tracking-wide text-[#f7c948]">Battle Result</p><h1 className="mt-3 font-display text-5xl font-black">{victory ? "Victory" : "Defeat"}</h1><p className="mt-4 text-lg text-[#d9f8df]">{victory ? "Kween's crown now displays a tiny badge reading: context beats confidence." : "Kween is still posing dramatically. Improve the instruction and try again."}</p>{victory ? <div className="mt-6 w-fit rounded border-4 border-[#0b1c15] bg-[#f7c948] px-5 py-3 font-black text-[#102d1f]">Badge earned: Benchmark Buster</div> : null}<div className="mt-8 flex gap-3"><button className="rounded border-2 border-[#f7c948] bg-[#f7c948] px-5 py-3 font-black text-[#102d1f]" type="button" onClick={retry}>Retry</button><button className="rounded border-2 border-[#8bd3dd] bg-[#173f35] px-5 py-3 font-black" type="button" onClick={() => setScreen("meadow")}>Return to Meadow</button></div></section></main>; }

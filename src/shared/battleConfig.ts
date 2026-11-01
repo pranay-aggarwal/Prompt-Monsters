@@ -11,5 +11,15 @@ export const BATTLE_CONFIG = {
     coddyDirectDamage: 10,
     kweenShieldGain: 5,
     kweenRoyalStrikeDamage: 8,
+    astraBonusDamage: 5,
+    astraCoddyShieldBonus: 8,
+    soliAssistHeal: 5,
   },
+  damageBands: [
+    { minimum: 0, damage: 6 },
+    { minimum: 40, damage: 16 },
+    { minimum: 60, damage: 24 },
+    { minimum: 80, damage: 30 },
+  ],
+  liveTurnsPerBattle: 4,
 } as const;
