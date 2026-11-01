@@ -1,6 +1,7 @@
 # PROMPT MONSTERS — AGENT GROUND TRUTH
 
-**Authority:** This is the single source of truth for the MVP.
+**Authority:** This merged file is the single source of truth for the MVP
+**Audience:** All four teammates and every Codex agent working in this repository.
 **Primary instruction:** Codex is the implementation agent. The product decisions, scope, sequence, contracts, and acceptance criteria are already defined here. Do not spend Codex usage re-planning the project.
 
 > **DO NOT BUILD UNTIL EXPLICITLY ASSIGNED.** Reading this file, opening the repository, or being asked to understand the project is not permission to edit code. When the project owner explicitly assigns a module, implement that module directly according to this document. Do not respond with another roadmap or ask the owner to approve a plan that is already specified here.
