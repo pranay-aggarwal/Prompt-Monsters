@@ -11,5 +11,6 @@
     "strict": true,
     "noEmit": true
   },
-  "include": ["vite.config.ts", "tailwind.config.ts"]
+  "types": ["node"],
+  "include": ["vite.config.ts", "tailwind.config.ts", "server/**/*.ts", "src/shared/types.ts"]
 }
