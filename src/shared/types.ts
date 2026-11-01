@@ -55,6 +55,7 @@ export interface MonsterTurnOutput {
   monsterResponse: string;
   argument: string;
   proposedActions: ProposedMonsterAction[];
+  predictedMove: "benchmark_brag" | "score_surge" | "royal_strike" | null;
 }
 
 export interface JudgeEvaluation {

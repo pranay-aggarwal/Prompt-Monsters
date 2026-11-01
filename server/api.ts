@@ -86,8 +86,9 @@ const responseSchema = {
     monsterResponse: { type: "string" },
     argument: { type: "string" },
     proposedActions: { type: "array", items: actionSchema },
+    predictedMove: { anyOf: [{ type: "string", enum: ["benchmark_brag", "score_surge", "royal_strike"] }, { type: "null" }] },
   },
-  required: ["monsterResponse", "argument", "proposedActions"],
+  required: ["monsterResponse", "argument", "proposedActions", "predictedMove"],
   additionalProperties: false,
 };
 
@@ -192,17 +193,23 @@ export function apiMiddleware() {
       else if (requestResearch) { usage.exa += 1; try { researchResults = await searchExa(`${scenario.claim} ${scenario.context} ${instruction}`); } catch { researchNotice = "Exa research was unavailable; continuing without new evidence."; } }
       const activeProfile = MONSTERS.find((monster) => monster.id === active)!;
       const partnerProfile = partner ? MONSTERS.find((monster) => monster.id === partner) : null;
-      const turnInput = JSON.stringify({ scenario, instruction, activeMonster: activeProfile, partnerMonster: partnerProfile, selectedMonsterIds: team, researchResults });
-      const monsterSystem = "You are the active Prompt Monsters creature. Address Kween's authored claim accurately and substantively. Stay in the canonical personality and reasoning approach, but never invent evidence, citations, abilities, or rules. Return only the requested JSON shape. Proposed actions must use the active monster and may include the requested partner only.";
+      const context = body.battleContext && typeof body.battleContext === "object" ? body.battleContext as JsonRecord : {};
+      const moveIds: Record<string, string> = { "Benchmark Brag": "benchmark_brag", "Score Surge": "score_surge", "Royal Strike": "royal_strike" };
+      const nextBossMove = typeof context.nextBossMove === "string" ? moveIds[context.nextBossMove] ?? "unknown" : "unknown";
+      const turnInput = JSON.stringify({ scenario, instruction, activeMonster: activeProfile, partnerMonster: partnerProfile, selectedMonsterIds: team, nextBossMove, researchResults });
+      const monsterSystem = "You are the active Prompt Monsters creature. Address Kween's authored claim accurately and substantively. Stay in the canonical personality and reasoning approach, but never invent evidence, citations, abilities, or rules. Return only the requested JSON shape. Proposed actions must use the active monster and may include the requested partner only. If proposing Giptoo's Pattern Echo, set predictedMove to the supplied nextBossMove value. Otherwise set predictedMove to null.";
       const monsterRaw = await callProvider(config, config.model, monsterSystem, turnInput, "monster_turn", responseSchema);
       const monsterResponse = typeof monsterRaw.monsterResponse === "string" ? monsterRaw.monsterResponse.slice(0, 2_000) : "";
       const argument = typeof monsterRaw.argument === "string" ? monsterRaw.argument.slice(0, 2_000) : "";
       const proposedActions = validatedActions(monsterRaw, team, active, partner ?? undefined);
+      const predictedMove = ["benchmark_brag", "score_surge", "royal_strike"].includes(String(monsterRaw.predictedMove)) ? monsterRaw.predictedMove as MonsterTurnOutput["predictedMove"] : null;
+      const usesPrediction = proposedActions.some((action) => action.actionId === "giptoo_pattern_echo");
+      if (usesPrediction !== (predictedMove !== null)) throw new Error("Monster response contained an invalid Pattern Echo prediction.");
       if (!monsterResponse || !argument || !proposedActions.some((action) => action.monsterId === active)) throw new Error("Monster response did not contain a valid active action.");
       const judgeRaw = await callProvider(config, config.judgeModel, "You are a neutral evaluator for a prompt-driven argument game. Do not roleplay, mention providers, invent evidence, or decide game state. Score only the supplied prompt and argument against the authored scenario. Return only the required JSON shape.", JSON.stringify({ scenario, instruction, argument, researchResults }), "judge_evaluation", judgeSchema);
       const evaluation = validJudge(judgeRaw, scenario.evidenceRequirement === "required" || (scenario.evidenceRequirement === "recommended" && requestResearch));
       if (!evaluation) throw new Error("Judge returned invalid evaluation.");
-      const output: MonsterTurnOutput = { monsterResponse, argument, proposedActions };
+      const output: MonsterTurnOutput = { monsterResponse, argument, proposedActions, predictedMove };
       return json(response, 200, { ok: true, mode: "live", ...output, researchResults, researchNotice, evaluation });
     } catch (error) {
       const message = error instanceof Error ? error.message : "Live provider unavailable.";
