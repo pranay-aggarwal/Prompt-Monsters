@@ -7,6 +7,10 @@
 
 > **DO NOT BUILD UNTIL EXPLICITLY ASSIGNED.** Reading this file, opening the repository, or being asked to understand the project is not permission to edit code. When the project owner explicitly assigns a module, implement that module directly according to this document. Do not respond with another roadmap or ask the owner to approve a plan that is already specified here.
 
+## Owner-approved exploration update — 1 November 2026
+
+The owner explicitly changed the collection flow: the five canonical monsters appear at random reachable positions in Prompt Meadow each new adventure. The player finds and collects them through an encounter on the map, then selects exactly three from their collected monsters. Undiscovered monsters cannot be added to the battle team. This supersedes the initial all-five-unlocked rule below. Keep collection simple and guaranteed on interaction; no catch probability, extra species, or additional encounters/bosses are authorised. The map and player must remain visible and correctly layered across desktop and mobile viewports.
+
 ---
 
 # 1. Agent operating rules — mandatory

@@ -1,8 +1,8 @@
 import type { JudgeEvaluation, MonsterId, MonsterTurnOutput, ResearchResult, SelectedTeam } from "./types";
 
 export type BattleTurnResponse =
-  | ({ ok: true; mode: "live"; researchResults: ResearchResult[]; researchNotice?: string; evaluation: JudgeEvaluation } & MonsterTurnOutput)
-  | { ok: false; mode: "offline"; error: string };
+  | ({ ok: true; mode: "live"; researchResults: ResearchResult[]; researchNotice?: string; researchUsed?: boolean; evaluation: JudgeEvaluation } & MonsterTurnOutput)
+  | { ok: false; mode: "offline"; error: string; monsterTurn?: MonsterTurnOutput; researchResults?: ResearchResult[]; researchUsed?: boolean };
 
 export function createBattleSessionId() {
   return typeof crypto !== "undefined" && "randomUUID" in crypto ? crypto.randomUUID() : `battle-${Date.now()}`;
@@ -23,9 +23,12 @@ export async function battleTurn(input: {
       method: "POST",
       headers: { "Content-Type": "application/json", "x-battle-id": input.battleId },
       body: JSON.stringify(input),
+      signal: AbortSignal.timeout(40_000),
     });
-    const payload = (await response.json()) as BattleTurnResponse;
-    return response.ok ? payload : { ok: false, mode: "offline", error: "error" in payload ? payload.error : "Live AI unavailable." };
+    const payload: unknown = await response.json();
+    if (!payload || typeof payload !== "object" || !("ok" in payload)) throw new Error("Invalid turn response");
+    if (!response.ok && !("error" in payload)) throw new Error("Turn unavailable");
+    return payload as BattleTurnResponse;
   } catch {
     return { ok: false, mode: "offline", error: "Live AI unavailable. Continue in Offline Practice Mode." };
   }

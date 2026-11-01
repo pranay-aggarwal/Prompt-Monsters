@@ -22,4 +22,5 @@ export const BATTLE_CONFIG = {
     { minimum: 80, damage: 30 },
   ],
   liveTurnsPerBattle: 4,
+  evaluationWeights: { relevance: 0.25, reasoning: 0.25, counterargument: 0.2, evidence: 0.2, clarity: 0.1, argument: 0.85, prompt: 0.15 },
 } as const;

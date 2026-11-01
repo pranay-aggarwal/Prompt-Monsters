@@ -1,0 +1,10 @@
+import type { CSSProperties, ReactNode } from "react";
+import type { AppScreen } from "../shared/navigation";
+import type { MonsterId } from "../shared/types";
+import { monsterFor } from "../game/battle";
+export const ROLES: Record<MonsterId, string> = { soli: "The encourager", astra: "The deep thinker", giptoo: "The pattern finder", sori: "The dreamer", coddy: "The problem solver" };
+export const EFFECTS: Record<MonsterId, string> = { soli: "Restore 10 HP to your most injured living ally.", astra: "Reveal Kween's next move. Your next argument gets +5 impact.", giptoo: "Predict Kween's move. A correct prediction reduces the next hit by 10.", sori: "Create a decoy that absorbs the next Royal Strike.", coddy: "Remove 15 shield, or deal 10 direct damage if the shield is gone." };
+export const palette = (id: MonsterId): CSSProperties => ({ "--monster-color": monsterFor(id).primaryColor } as CSSProperties);
+export function Brand() { return <div className="brand"><span className="brand-mark">✦</span><span>PROMPT<span className="brand-second">MONSTERS</span></span></div>; }
+export function Header({ screen, children }: { screen: AppScreen; children?: ReactNode }) { return <header className="app-header"><Brand /><nav className="journey" aria-label="Adventure progress">{["Explore", "Choose your team", "Challenge Kween"].map((name, i) => <span key={name} className={i === (screen === "battle" || screen === "result" ? 2 : screen === "collection" ? 1 : 0) ? "current" : ""}><b>0{i + 1}</b>{name}</span>)}</nav><div className="header-actions">{children}</div></header>; }
+export function Health({ value, max = 30, shield = false, label }: { value: number; max?: number; shield?: boolean; label: string }) { return <div className={`health ${shield ? "health-shield" : ""} ${!shield && value / max <= .25 ? "health-low" : ""}`} role="progressbar" aria-label={label} aria-valuenow={value} aria-valuemin={0} aria-valuemax={max}><span style={{ width: `${Math.max(0, Math.min(100, value / max * 100))}%` }} /></div>; }
